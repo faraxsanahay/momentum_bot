@@ -1,0 +1,138 @@
+import requests
+import pandas as pd
+import json
+import time
+import binance
+import ccxt
+import schedule
+import os
+import ccxt
+from binance.client import Client
+from datetime import datetime, timedelta
+from itertools import count
+import ccxt
+from binance import ThreadedWebsocketManager
+import math
+import backtesting
+
+from binance.client import Client
+
+
+class MomentumStrategy:
+    def __init__(self, api_key, api_secret):
+        self.client = Client(api_key, api_secret)
+        self.exchange = ccxt.binance()
+
+    def get_busd_balances(self):
+        account_info = self.client.get_account()
+        busd_balances = [balance for balance in account_info["balances"] if balance["asset"] == "BUSD"]
+        return busd_balances
+
+    def get_candlesticks(self, symbol, interval):
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=1"
+        response = requests.get(url)
+        data = json.loads(response.text)
+        return symbol, float(data[0][1]), float(data[0][4])
+
+    def get_top_symbols(self, limit=100):
+        symbols = requests.get("https://api.binance.com/api/v3/ticker/24hr").json()
+        symbols = [symbol for symbol in symbols if symbol["symbol"].endswith("BUSD")]
+        symbols.sort(key=lambda x: x["quoteVolume"], reverse=True)
+        symbols = [symbol["symbol"] for symbol in symbols[:limit]]
+        symbols = [symbol for symbol in symbols if symbol not in ["BCHABUSD", "GTOBUSD", "RAMPBUSD", "ERDBUSD"]]
+        return symbols
+
+    def get_top_price_changes(self, symbols, interval="5m"):
+        price_changes = []
+        for symbol in symbols:
+            symbol, open_price, close_price = self.get_candlesticks(symbol, interval)
+            price_change = (close_price - open_price) / open_price * 100
+            price_changes.append((symbol, price_change))
+        price_changes.sort(key=lambda x: x[1], reverse=True)
+        return price_changes
+
+    def place_order(self, symbol, quantity, side):
+        order = self.client.create_order(
+            symbol=symbol,
+            side=side,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        return order
+
+    def trailing_stop_loss(self, symbol, quantity, stop_loss_percent, market_price):
+        stop_loss_price = market_price * (1 - stop_loss_percent)
+        while True:
+            current_price = self.exchange.fetch_ticker(symbol)['last']
+            if current_price >= market_price:
+                market_price = current_price
+                stop_loss_price = market_price * (1 - stop_loss_percent)
+            elif current_price <= stop_loss_price:
+                print("Stop loss triggered. Sell order executed.")
+                sell_order = self.place_order(symbol, quantity, Client.SIDE_SELL)
+                print(f"Sell order for {symbol} placed. Order ID: {sell_order['orderId']}")
+                break
+            time.sleep(30)
+
+    def run_strategy(self):
+        busd_balances = self.get_busd_balances()
+        balance = float(next(b for b in busd_balances if b["asset"] == "BUSD")["free"])
+
+        print(f"Current BUSD balance: {balance:.2f}")
+
+        symbols = self.get_top_symbols()
+        price_changes = self.get_top_price_changes(symbols)
+
+        print("Top 3 pairs by 5-minute price change:")
+        for symbol, price_change in price_changes[:3]:
+            print(f"{symbol}: {price_change:.2f}%")
+
+        top_pair = str(price_changes[0][0])
+        market_price = self.exchange.fetch_ticker(top_pair)['last']
+        trade_count = 0
+        win_count = 0
+        loss_count = 0
+
+        if price_changes[0][1] < 3:
+            print(f"Price increase of {top_pair} is less than 3%. No order placed.")
+            return
+
+        quantity = balance * 0.3 / market_price
+        quantity = math.ceil(quantity)
+
+        buy_order = self.place_order(top_pair, quantity, Client.SIDE_BUY)
+        trade_count += 1
+        print(f"Buy order for {top_pair} placed. Order ID: {buy_order['orderId']}")
+
+        stop_loss_percent = 0.005
+        stop_loss_price = market_price * (1 - stop_loss_percent)
+        print(f"Stop loss set at {stop_loss_price:.4f}")
+
+        while True:
+            current_price = self.exchange.fetch_ticker(top_pair)['last']
+            change_percent = (current_price - market_price) / market_price * 100
+            portfolio_change_percent = (current_price * quantity - market_price * quantity) / balance * 100
+
+            if current_price >= market_price:
+                market_price = current_price
+                stop_loss_price = market_price * (1 - stop_loss_percent)
+
+            print(f"{top_pair}: current price {current_price:.4f}, change {change_percent:.2f}%, portfolio change {portfolio_change_percent:.2f}%")
+
+            if current_price <= stop_loss_price:
+                sell_order = self.place_order(top_pair, quantity, Client.SIDE_SELL)
+                trade_count += 1
+                if portfolio_change_percent > 0:
+                    win_count += 1
+                    print("Stop loss triggered. Sell order executed. Win!")
+                else:
+                    loss_count += 1
+                    print("Stop loss triggered. Sell order executed. Loss...")
+                print(f"Sell order for {top_pair} placed. Order ID: {sell_order['orderId']}")
+                break
+
+            time.sleep(30)
+
+        win_ratio = win_count / trade_count * 100 if trade_count > 0 else 0
+        loss_ratio = loss_count / trade_count * 100 if trade_count > 0 else 0
+        print(f"Win/Loss ratio: {win_count}/{loss_count} ({win_ratio:.2f}%/{loss_ratio:.2f}%)")
