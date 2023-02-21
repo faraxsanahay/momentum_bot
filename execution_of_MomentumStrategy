@@ -1,0 +1,8 @@
+api_key = "your_key_here"
+api_secret = "your_secret_here"
+
+strategy = MomentumStrategy(api_key, api_secret)
+
+# Run the strategy in a loop continuously
+while True:
+    strategy.run_strategy()
